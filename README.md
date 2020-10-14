@@ -1,3 +1,47 @@
+# 本项目的部分改动和优化
+
+- 1.添加下载进度条；
+- 2.添加多线程下载；
+- 3.添加main、free的channel支持；
+- 4.取消缓存目录在部分操作删除已下载包
+
+## 安装
+
+```
+git clone https://github.com/lixiang0/conda-mirror
+cd conda-mirror
+python setup.py install
+```
+## 使用示例
+
+1.下载目录下创建conf.yaml，内容为：
+```
+blacklist:
+    - build: 'py2*'
+whitelist:
+    - build: 'py3*'
+```
+释义：屏蔽python2的版本，只下载python3的版本包
+
+2.执行命令：
+```
+conda-mirror --upstream-channel main  --platform linux-64 -vvv --num-threads 12 --temp-directory ./temp/ -k --config conf.yaml
+```
+释义：
+- platform：下载对应平台下的包
+- vvv:显示warnning信息
+- num-threads下载和验证线程数目
+- temp-directory：缓存目录
+- k：不使用https
+- config：包过滤配置
+
+运行截图：
+![](conda-mirror1.png)
+
+------
+
+以下为原项目的README.MD
+
 # conda-mirror
 
 [![Project Status: Inactive – The project has reached a stable, usable state but is no longer being actively developed; support/maintenance will be provided as time allows.](https://www.repostatus.org/badges/latest/inactive.svg)](https://www.repostatus.org/#inactive)
