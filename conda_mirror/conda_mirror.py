@@ -11,8 +11,10 @@ import shutil
 import sys
 import tarfile
 import tempfile
+import time
+import random
 from pprint import pformat
-
+import tqdm
 import requests
 import yaml
 
@@ -26,7 +28,8 @@ DEFAULT_PLATFORMS = ['linux-64',
                      'win-64',
                      'win-32']
 
-
+channel2url={'main':'https://repo.anaconda.com/pkgs/main',\
+    'free':'https://repo.anaconda.com/pkgs/free'}
 def _maybe_split_channel(channel):
     """Split channel if it is fully qualified.
 
@@ -52,15 +55,19 @@ def _maybe_split_channel(channel):
 
     """
     # strip trailing slashes
-    channel = channel.strip('/')
-
-    default_url_base = "https://conda.anaconda.org/"
+    default_url_base = "https://conda.anaconda.org"
     url_suffix = "/{channel}/{platform}/{file_name}"
-    if '://' not in channel:
+    # if '://' not in channel:
+    if channel=='conda-forge':
         # assume we are being given a channel for anaconda.org
         logger.debug("Assuming %s is an anaconda.org channel", channel)
         url = default_url_base + url_suffix
         return url, channel
+    if channel in channel2url.keys():
+        #https://repo.anaconda.com/pkgs/main/linux-64/
+        default_url_base='https://repo.anaconda.com/pkgs' 
+        url = default_url_base + url_suffix
+        return url, channel  
     # looks like we are being given a fully qualified channel
     download_base, channel = channel.rsplit('/', 1)
     download_template = download_base + url_suffix
@@ -105,6 +112,16 @@ def _match(all_packages, key_glob_dict):
     return matched
 
 
+def _str_or_false(x):
+    """
+    Returns a boolean False if x is the string "False" or similar.
+    Returns the original string otherwise.
+    """
+    if x.lower() == "false":
+        x = False
+    return x
+
+
 def _make_arg_parser():
     """
     Localize the ArgumentParser logic
@@ -126,6 +143,7 @@ def _make_arg_parser():
     ap.add_argument(
         '--target-directory',
         help='The place where packages should be mirrored to',
+        default='.'
     )
     ap.add_argument(
         '--temp-directory',
@@ -190,6 +208,36 @@ def _make_arg_parser():
         help=("Threshold for free diskspace. Given in megabytes."),
         type=int,
         default=1000,
+    )
+    ap.add_argument(
+        '--proxy',
+        help=('Proxy URL to access internet if needed'),
+        type=str,
+        default=None,
+    )
+    ap.add_argument(
+        '--ssl-verify', '--ssl_verify',
+        help=('Path to a CA_BUNDLE file with certificates of trusted CAs, '
+              'this may be "False" to disable verification as per the '
+              'requests API.'),
+        type=_str_or_false,
+        default=None,
+        dest='ssl_verify',
+    )
+    ap.add_argument(
+        '-k', '--insecure',
+        help=('Allow conda to perform "insecure" SSL connections and '
+              "transfers. Equivalent to setting 'ssl_verify' to 'false'."),
+        action="store_false",
+        dest="ssl_verify",
+    )
+    ap.add_argument(
+        '--max-retries',
+        help=('Maximum  number of retries before a download error is reraised, '
+              "defaults to 100"),
+        type=int,
+        default=100,
+        dest="max_retries",
     )
     return ap
 
@@ -260,7 +308,7 @@ def _parse_and_format_args():
     blacklist = config_dict.get('blacklist')
     whitelist = config_dict.get('whitelist')
 
-    for required in ('target_directory', 'platform', 'upstream_channel'):
+    for required in ('platform', 'upstream_channel'):
         if (not getattr(args, required)):
             raise ValueError("Missing command line argument: %s", required)
 
@@ -270,6 +318,21 @@ def _parse_and_format_args():
             pdb.post_mortem(traceback)
         sys.excepthook = pdb_hook
 
+    proxies = args.proxy
+    if proxies is not None:
+        # use scheme of proxy url to generate dictionary
+        # if no extra scheme is given
+        # examples:
+        # "http:https://user:pass@proxy.tld"
+        #  -> {'http': 'https://user:pass@proxy.tld'}
+        # "https://user:pass@proxy.tld"
+        #  -> {'https': 'https://user:pass@proxy.tld'}
+        scheme, *url = proxies.split(':')
+        if len(url) > 1:
+            url = ':'.join(url)
+        else:
+            url = '{}:{}'.format(scheme, url[0])
+        proxies = {scheme: url}
     return {
         'upstream_channel': args.upstream_channel,
         'target_directory': args.target_directory,
@@ -281,6 +344,9 @@ def _parse_and_format_args():
         'dry_run': args.dry_run,
         'no_validate_target': args.no_validate_target,
         'minimum_free_space': args.minimum_free_space,
+        'proxies': proxies,
+        'ssl_verify': args.ssl_verify,
+        'max_retries': args.max_retries,
     }
 
 
@@ -308,7 +374,7 @@ def _remove_package(pkg_path, reason):
     """
     msg = "Removing: %s. Reason: %s" % (pkg_path, reason)
     logger.warning(msg)
-    os.remove(pkg_path)
+    # os.remove(pkg_path)
     return pkg_path, msg
 
 
@@ -361,7 +427,7 @@ def _validate(filename, md5=None, size=None):
     return filename, None
 
 
-def get_repodata(channel, platform):
+def get_repodata(channel, platform, proxies=None, ssl_verify=None):
     """Get the repodata.json file for a channel/platform combo on anaconda.org
 
     Parameters
@@ -370,6 +436,10 @@ def get_repodata(channel, platform):
         anaconda.org/CHANNEL
     platform : {'linux-64', 'linux-32', 'osx-64', 'win-32', 'win-64'}
         The platform of interest
+    proxies : dict
+        Proxys for connecting internet
+    ssl_verify : str or bool
+        Path to a CA_BUNDLE file or directory with certificates of trusted CAs
 
     Returns
     -------
@@ -380,8 +450,7 @@ def get_repodata(channel, platform):
     url_template, channel = _maybe_split_channel(channel)
     url = url_template.format(channel=channel, platform=platform,
                               file_name='repodata.json')
-
-    resp = requests.get(url).json()
+    resp = requests.get(url, proxies=proxies, verify=ssl_verify).json()
     info = resp.get('info', {})
     packages = resp.get('packages', {})
     # Patch the repodata.json so that all package info dicts contain a "subdir"
@@ -393,7 +462,7 @@ def get_repodata(channel, platform):
     return info, packages
 
 
-def _download(url, target_directory):
+def _download(url, target_directory, proxies=None, ssl_verify=None):
     """Download `url` to `target_directory`
 
     Parameters
@@ -402,6 +471,10 @@ def _download(url, target_directory):
         The url to download
     target_directory : str
         The path to a directory where `url` should be downloaded
+    proxies : dict
+        Proxys for connecting internet
+    ssl_verify : str or bool
+        Path to a CA_BUNDLE file or directory with certificates of trusted CAs
 
     Returns
     -------
@@ -409,18 +482,64 @@ def _download(url, target_directory):
         The size in bytes of the file that was downloaded
     """
     file_size = 0
-    chunk_size = 1024  # 1KB chunks
+    chunk_size = 1024*1024*10  # 10MB chunks
     logger.info("download_url=%s", url)
     # create a temporary file
     target_filename = url.split('/')[-1]
     download_filename = os.path.join(target_directory, target_filename)
     logger.debug('downloading to %s', download_filename)
     with open(download_filename, 'w+b') as tf:
-        ret = requests.get(url, stream=True)
+        ret = requests.get(url, stream=True,
+                           proxies=proxies, verify=ssl_verify)
+        file_size=ret.headers['Content-length']
+        pbar=tqdm.tqdm(total=int(file_size),unit='B',unit_scale=True,desc=url.split('/')[-1])
         for data in ret.iter_content(chunk_size):
             tf.write(data)
+            pbar.update(chunk_size)
+        pbar.close()
         file_size = os.path.getsize(download_filename)
     return file_size
+
+
+def _download_backoff_retry(url, target_directory, proxies=None, ssl_verify=None, max_retries=100):
+    """Download `url` to `target_directory` with exponential backoff in the
+    event of failure.
+
+    Parameters
+    ----------
+    url : str
+        The url to download
+    target_directory : str
+        The path to a directory where `url` should be downloaded
+    proxies : dict
+        Proxys for connecting internet
+    ssl_verify : str or bool
+        Path to a CA_BUNDLE file or directory with certificates of trusted CAs
+    max_retries : int, optional
+        The maximum number of times to retry before the download error is reraised,
+        default 100.
+
+    Returns
+    -------
+    file_size: int
+        The size in bytes of the file that was downloaded
+    """
+    c = 0
+    two_c = 1
+    delay = 5.12e-5  # 51.2 us
+    while c < max_retries:
+        c += 1
+        two_c *= 2
+        try:
+            rtn = _download(url, target_directory, proxies=proxies, ssl_verify=ssl_verify)
+            break
+        except Exception:
+            if c < max_retries:
+                logger.debug('downloading failed, retrying {0}/{1}'.format(c, max_retries))
+                time.sleep(delay * random.randint(0, two_c - 1))
+            else:
+                raise
+    return rtn
 
 
 def _list_conda_packages(local_dir):
@@ -547,7 +666,8 @@ def _validate_or_remove_package(args):
 
 def main(upstream_channel, target_directory, temp_directory, platform,
          blacklist=None, whitelist=None, num_threads=1, dry_run=False,
-         no_validate_target=False, minimum_free_space=0):
+         no_validate_target=False, minimum_free_space=0, proxies=None,
+         ssl_verify=None, max_retries=100):
     """
 
     Parameters
@@ -589,6 +709,13 @@ def main(upstream_channel, target_directory, temp_directory, platform,
         If True, skip validation of files already present in target_directory.
     minimum_free_space : int, optional
         Stop downloading when free space target_directory or temp_directory reach this threshold.
+    proxies : dict
+        Proxys for connecting internet
+    ssl_verify : str or bool
+        Path to a CA_BUNDLE file or directory with certificates of trusted CAs
+    max_retries : int, optional
+        The maximum number of times to retry before the download error is reraised,
+        default 100.
 
     Returns
     -------
@@ -646,10 +773,18 @@ def main(upstream_channel, target_directory, temp_directory, platform,
         'to-mirror': set()
     }
     # Implementation:
+    #add by ruben
+    paths=channel2url[upstream_channel].split('/')
+    target_directory=os.path.join(target_directory,paths[-2],paths[-1])
+    logger.debug('current local mirror dir: %s',target_directory)
+    # if not os.path.exists(os.path.join(target_directory, upstream_channel)):
+    #     os.makedirs(os.path.join(target_directory, upstream_channel))
+    #     target_directory=os.path.join(target_directory, upstream_channel)
     if not os.path.exists(os.path.join(target_directory, platform)):
         os.makedirs(os.path.join(target_directory, platform))
-
-    info, packages = get_repodata(upstream_channel, platform)
+    # print(upstream_channel)
+    info, packages = get_repodata(upstream_channel, platform,
+                                  proxies=proxies, ssl_verify=ssl_verify)
     local_directory = os.path.join(target_directory, platform)
 
     # 1. validate local repo
@@ -724,34 +859,45 @@ def main(upstream_channel, target_directory, temp_directory, platform,
     total_bytes = 0
     minimum_free_space_kb = (minimum_free_space * 1024 * 1024)
     download_url, channel = _maybe_split_channel(upstream_channel)
-    with tempfile.TemporaryDirectory(dir=temp_directory) as download_dir:
+ #   with tempfile.TemporaryDirectory(dir=temp_directory) as download_dir:
+
+    download_dir=temp_directory
+    if True:
         logger.info('downloading to the tempdir %s', download_dir)
+        urls=[]
         for package_name in sorted(to_mirror):
             url = download_url.format(
                 channel=channel,
                 platform=platform,
                 file_name=package_name)
-            try:
-                # make sure we have enough free disk space in the temp folder to meet threshold
-                if shutil.disk_usage(download_dir).free < minimum_free_space_kb:
-                    logger.error('Disk space below threshold in %s. Aborting download.',
-                                 download_dir)
-                    break
+            urls.append((url,download_dir,proxies,ssl_verify,max_retries))
+        try:
+            # make sure we have enough free disk space in the temp folder to meet threshold
+            if shutil.disk_usage(download_dir).free < minimum_free_space_kb:
+                logger.error('Disk space below threshold in %s. Aborting download.',
+                                download_dir)
+                
 
-                # download package
-                total_bytes += _download(url, download_dir)
+            # download package
+            # total_bytes += _download_backoff_retry(url, download_dir,
+            #                                         proxies=proxies,
+            #                                         ssl_verify=ssl_verify,
+            #                                         max_retries=max_retries)
+            p = multiprocessing.Pool(num_threads)
+            results=p.starmap(_download_backoff_retry,urls)
+            # total_bytes=[temp_bytes for temp_bytes in results]
+            # make sure we have enough free disk space in the target folder to meet threshold
+            # while also being able to fit the packages we have already downloaded
+            if (shutil.disk_usage(local_directory).free - total_bytes) < minimum_free_space_kb:
+                logger.error('Disk space below threshold in %s. Aborting download',
+                                local_directory)
+                
 
-                # make sure we have enough free disk space in the target folder to meet threshold
-                # while also being able to fit the packages we have already downloaded
-                if (shutil.disk_usage(local_directory).free - total_bytes) < minimum_free_space_kb:
-                    logger.error('Disk space below threshold in %s. Aborting download',
-                                 local_directory)
-                    break
-
-                summary['downloaded'].add((url, download_dir))
-            except Exception as ex:
-                logger.exception('Unexpected error: %s. Aborting download.', ex)
-                break
+            # summary['downloaded'].add((url, download_dir))
+            # summary['downloaded'].add((results, download_dir))
+        except Exception as ex:
+            logger.exception('Unexpected error: %s. Aborting download.', ex)
+            
 
         # validate all packages in the download directory
         validation_results = _validate_packages(packages, download_dir,
