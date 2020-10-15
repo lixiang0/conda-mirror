@@ -1,5 +1,6 @@
 # 本项目的部分改动和优化
 
+
 - 1.添加下载进度条；
 - 2.添加多线程下载；
 - 3.添加main、free的channel支持；
@@ -26,6 +27,7 @@ whitelist:
 2.执行命令：
 ```
 conda-mirror --upstream-channel main  --platform linux-64 -vvv --num-threads 12 --temp-directory ./temp/ -k --config conf.yaml
+conda index ~/files/anaconda-bare/pkgs/main  #这里注意要换成自己的目录
 ```
 释义：
 - platform：下载对应平台下的包
@@ -34,6 +36,35 @@ conda-mirror --upstream-channel main  --platform linux-64 -vvv --num-threads 12 
 - temp-directory：缓存目录
 - k：不使用https
 - config：包过滤配置
+上述命令先是镜像，然后是建立索引。
+
+执行完毕后，新建一个test环境示例：
+```
+conda create -n test
+Collecting package metadata (current_repodata.json): done
+Solving environment: done
+
+## Package Plan ##
+
+  environment location: /home/ruben/anaconda3/envs/test
+
+
+
+Proceed ([y]/n)? y
+
+Preparing transaction: done
+Verifying transaction: done
+Executing transaction: done
+#
+# To activate this environment, use
+#
+#     $ conda activate test
+#
+# To deactivate an active environment, use
+#
+#     $ conda deactivate
+
+```
 
 运行截图：
 ![](conda-mirror1.png)
